@@ -17,6 +17,7 @@ import pandas as pd
 # Configuration
 # -----------------------------
 ROOT_DIR = os.path.expanduser("~/Desktop/duckysets")
+MNI_TEMPLATE_PATH = os.path.join(ROOT_DIR, "MNI152_T1_1mm_Brain.nii.gz")  # Added MNI template
 PIPELINES = {
     "freesurfer741ants243": "aseg_MNI.nii.gz",
     "freesurfer8001ants243": "aseg_MNI.nii.gz",
@@ -109,6 +110,16 @@ ref_img = nib.load(pipeline_files[list(PIPELINES.keys())[0]][0])
 print(f"\nReference chosen: {ref_img.shape}")
 
 # -----------------------------
+# Load and prepare MNI template (MOVED AFTER ref_img IS DEFINED)
+# -----------------------------
+print("Loading MNI template...")
+mni_template_img = nib.load(MNI_TEMPLATE_PATH)
+# Resample MNI template to match our reference image space
+mni_template_resampled = resample_from_to(mni_template_img, (ref_img.shape, ref_img.affine))
+mni_template = mni_template_resampled.get_fdata()
+print(f"MNI template shape: {mni_template.shape} (resampled to match reference)")
+
+# -----------------------------
 # Compute pipeline disagreement maps
 # -----------------------------
 print("\n Computing pipeline disagreements...")
@@ -187,7 +198,7 @@ for stats in disagreement_stats:
 best_slices = [59, 74, 87]  # Your hardcoded slices
 
 # -----------------------------
-# Plot multi-row figure with disagreement heatmaps
+# Plot multi-row figure with disagreement heatmaps OVER MNI TEMPLATE
 # -----------------------------
 n_comparisons = len(disagreement_maps)
 fig, axes = plt.subplots(SLICES_TO_SHOW, n_comparisons, 
@@ -209,8 +220,14 @@ for r, sl_idx in enumerate(best_slices[::-1]):  # highest slice first
     
     for c, (comp_name, dm) in enumerate(disagreement_maps.items()):
         ax = axes[r][c] if SLICES_TO_SHOW > 1 else axes[c]
+        
+        # Plot MNI template as background
+        template_slice = np.rot90(mni_template[:, :, sl_idx])
+        ax.imshow(template_slice, cmap='gray', alpha=0.7)
+        
+        # Plot disagreement heatmap as overlay
         slice_img = np.rot90(dm[:, :, sl_idx])
-        im = ax.imshow(slice_img, cmap="hot", vmin=0, vmax=vmax)
+        im = ax.imshow(slice_img, cmap="hot", vmin=0, vmax=vmax, alpha=0.8)
         
         # Only first column gets the slice label
         if c == 0:
@@ -221,8 +238,17 @@ for r, sl_idx in enumerate(best_slices[::-1]):  # highest slice first
         if r == 0:
             # Shorten pipeline names for display
             pl1, pl2 = comp_name.split("_vs_")
-            pl1_short = pl1.replace('freesurfer', 'FS').replace('fslanat', 'FSL').replace('samseg', 'Samseg')
-            pl2_short = pl2.replace('freesurfer', 'FS').replace('fslanat', 'FSL').replace('samseg', 'Samseg')
+            
+            # Apply the new naming scheme
+            pl1_short = pl1.replace('freesurfer741ants243', 'FS741')\
+                           .replace('freesurfer8001ants243', 'FS8001')\
+                           .replace('fslanat6071ants243', 'FSL6071')\
+                           .replace('samseg8001ants243', 'Samseg8')
+            pl2_short = pl2.replace('freesurfer741ants243', 'FS741')\
+                           .replace('freesurfer8001ants243', 'FS8001')\
+                           .replace('fslanat6071ants243', 'FSL6071')\
+                           .replace('samseg8001ants243', 'Samseg8')
+    
             ax.set_title(f"{pl1_short} vs {pl2_short}\nn={len(matched_subjects)}", fontsize=10, pad=10)
 
         
@@ -235,13 +261,14 @@ cbar.ax.set_ylabel("Proportion of subjects with pipeline disagreement",
                   rotation=270, labelpad=15)
 
 plt.subplots_adjust(right=0.9, hspace=0.2, wspace=0.1)
-plt.suptitle("Pipeline Disagreement: Regions Where Pipelines Differ in Subcortical Segmentation", 
+plt.suptitle("Pipeline Disagreement Overlaid on MNI Template: Regions Where Pipelines Differ", 
              fontsize=14, y=0.95)
 plt.savefig(OUTPUT_PNG, dpi=200, bbox_inches='tight')
 plt.close(fig)
 print(f"\n Saved pipeline disagreement heatmap to: {OUTPUT_PNG}")
 
 print(f"\n Interpretation:")
-print("- Hot colors = regions where pipelines frequently disagree")
-print("- Cool colors = regions where pipelines usually agree") 
+print("- Gray background = MNI anatomical template")
+print("- Hot colors = regions where pipelines frequently disagree") 
+print("- Cool colors = regions where pipelines usually agree")
 print("- Shows anatomical locations with the most inter-pipeline variability")
