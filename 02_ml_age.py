@@ -11,7 +11,7 @@ STATE_DIR = ROOT
 EXPERIMENT_STATE_ROOT = ROOT
 
 # ----------------------------
-# Age extraction logic - EXACT SAME AS WORKING SCRIPT
+# Age extraction logic - UPDATED TO MATCH USERSCRIPT3
 # ----------------------------
 def load_tabular_data(dataset_path: Path):
     """Load all TSVs in the tabular/ directory."""
@@ -28,34 +28,55 @@ def load_tabular_data(dataset_path: Path):
     return dfs
 
 def extract_demographics(dataset_name: str, dfs: dict):
-    """Dataset-specific logic to extract age information."""
+    """Dataset-specific logic to extract age information - UPDATED TO MATCH USERSCRIPT3."""
+    df_demo = None
     dataset_lower = dataset_name.lower()
 
-    # PREVENT-AD logic
-    if dataset_lower == "preventad":
-        if "participants" in dfs and "ad8" in dfs:
-            part = dfs["participants"]
-            ad8 = dfs["ad8"]
-            ad8 = ad8.rename(columns={"participant_id": "subject", "Candidate_Age": "age_months"})
-            ad8["age"] = ad8["age_months"] / 12.0
-            df_demo = ad8.merge(part, left_on="subject", right_on="participant_id", how="left")
-            return df_demo[["subject", "visit_id", "age"]]
-
-    # ds003592 + ds005752 logic: age in participants.tsv
-    if dataset_lower in ("ds003592", "ds005752"):
-        df = dfs.get("participants")
-        if df is not None and "age" in df.columns:
-            return df.rename(columns={"participant_id": "subject"})[["subject", "age"]]
-
-    # default: try participants
-    if "participants" in dfs:
-        df_demo = dfs["participants"].rename(columns={"participant_id": "subject"})
-        if "age" not in df_demo.columns:
-            df_demo["age"] = np.nan
-        return df_demo[["subject", "age"]]
-
-    # No usable age data
-    return pd.DataFrame(columns=["subject", "age"])
+    # PREVENT-AD logic - UPDATED TO MATCH USERSCRIPT3
+    if dataset_lower == 'preventad':
+        if 'participants' in dfs and 'ad8' in dfs:
+            part = dfs['participants']
+            ad8 = dfs['ad8']
+            ad8 = ad8.rename(columns={'participant_id': 'subject', 'Candidate_Age': 'age_months'})
+            ad8['age'] = ad8['age_months'] / 12.0
+            df_demo = ad8.merge(part, left_on='subject', right_on='participant_id', how='left')
+            df_demo = df_demo[['subject', 'visit_id', 'age', 'sex']]
+    elif dataset_lower == 'ds005752':
+        df = dfs.get('participants', pd.DataFrame())
+        if not df.empty:
+            df_demo = df[['participant_id', 'age', 'sex']].rename(columns={'participant_id': 'subject'})
+    elif dataset_lower == 'ds003592':
+        df = dfs.get('participants', pd.DataFrame())
+        if not df.empty:
+            df_demo = df[['participant_id', 'age', 'sex']].rename(columns={'participant_id': 'subject'})
+    else:
+        if 'participants' in dfs:
+            df_demo = dfs['participants'].rename(columns={'participant_id': 'subject'})
+            if 'age' not in df_demo.columns:
+                df_demo['age'] = np.nan
+            if 'sex' not in df_demo.columns:
+                df_demo['sex'] = np.nan
+    
+    # Handle comma-separated multiple values by taking the first one - FROM USERSCRIPT3
+    if df_demo is not None and not df_demo.empty:
+        # For age: take first value and convert to float
+        if 'age' in df_demo.columns:
+            df_demo['age'] = df_demo['age'].astype(str).str.split(',').str[0]
+            # Replace 'n/a' with NaN and convert to float
+            df_demo['age'] = df_demo['age'].replace('n/a', np.nan)
+            df_demo['age'] = pd.to_numeric(df_demo['age'], errors='coerce')
+        
+        # For sex: take first value
+        if 'sex' in df_demo.columns:
+            df_demo['sex'] = df_demo['sex'].astype(str).str.split(',').str[0]
+            # Replace 'n/a' with NaN
+            df_demo['sex'] = df_demo['sex'].replace('n/a', np.nan)
+    
+    # Return only the columns we need for ML (subject and age)
+    if df_demo is not None and not df_demo.empty:
+        return df_demo[['subject', 'age']]
+    else:
+        return pd.DataFrame(columns=['subject', 'age'])
 
 # ----------------------------
 # Discover subjects and sessions - EXACT SAME AS WORKING SCRIPT
@@ -164,7 +185,7 @@ if __name__ == "__main__":
     print(f"Subjects with age data: {df_demo['age'].notna().sum()}")
     
     # Load morphological features and join
-    features_path = ROOT / "morphological_features_zscore.csv"
+    features_path = ROOT / "morphological_features_mni.csv"
     if features_path.exists():
         print(f"Loading morphological features from: {features_path}")
         df_features = pd.read_csv(features_path)
