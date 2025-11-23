@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, ExtraTreesRegressor
-from sklearn.linear_model import ElasticNet, Ridge, Lasso
+from sklearn.linear_model import ElasticNet
 from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
 from sklearn.model_selection import GroupKFold, GridSearchCV, cross_val_score, train_test_split
@@ -44,18 +44,10 @@ PIPELINES = {
     'all_pipelines': None  # Will use all features
 }
 
-# Hyperparameter grids - UPDATED with increased regularization and new models
+# Hyperparameter grids - UPDATED: removed Ridge and Lasso, kept only ElasticNet
 ELASTIC_NET_PARAMS = {
     'regressor__alpha': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0],
     'regressor__l1_ratio': [0.1, 0.3, 0.5, 0.7, 0.9]
-}
-
-RIDGE_PARAMS = {
-    'regressor__alpha': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
-}
-
-LASSO_PARAMS = {
-    'regressor__alpha': [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
 }
 
 RANDOM_FOREST_PARAMS = {
@@ -112,7 +104,7 @@ def clean_age_value(age):
     return float(age)
 
 def load_and_preprocess_data(file_path):
-    """Load and preprocess the data"""
+    """Load and preprocess the data - NOW WITHOUT NORMALIZATION"""
     print("Loading data...")
     df = pd.read_csv(file_path)
     
@@ -173,24 +165,120 @@ def get_features_for_pipeline(df, pipeline_name):
         return available_features
 
 # ----------------------------
+# Normalization Functions
+# ----------------------------
+
+class DatasetPipelineScaler:
+    """
+    Custom scaler that computes z-scores per dataset and pipeline combination
+    to account for batch effects across datasets and pipelines.
+    """
+    def __init__(self):
+        self.scalers_ = {}  # Store scalers for each (dataset, pipeline) combo
+        self.feature_means_ = {}
+        self.feature_stds_ = {}
+    
+    def fit(self, X, features, datasets, pipeline_name):
+        """
+        Fit scalers for each dataset in the training data
+        
+        Parameters:
+        - X: Feature matrix (numpy array)
+        - features: List of feature names
+        - datasets: Array of dataset identifiers for each sample
+        - pipeline_name: Name of the current pipeline
+        """
+        unique_datasets = np.unique(datasets)
+        
+        for dataset in unique_datasets:
+            dataset_mask = datasets == dataset
+            X_dataset = X[dataset_mask]
+            
+            # Compute mean and std for this dataset
+            if len(X_dataset) > 1:  # Need at least 2 samples for std
+                scaler = StandardScaler()
+                scaler.fit(X_dataset)
+                self.scalers_[(dataset, pipeline_name)] = scaler
+                
+                # Store means and stds for reference
+                self.feature_means_[(dataset, pipeline_name)] = scaler.mean_
+                self.feature_stds_[(dataset, pipeline_name)] = scaler.scale_
+            else:
+                # For single sample, use zero mean and unit variance (or handle differently)
+                self.scalers_[(dataset, pipeline_name)] = None
+        
+        return self
+    
+    def transform(self, X, features, datasets, pipeline_name):
+        """
+        Transform data using pre-fitted scalers
+        """
+        X_normalized = np.zeros_like(X)
+        
+        unique_datasets = np.unique(datasets)
+        
+        for dataset in unique_datasets:
+            dataset_mask = datasets == dataset
+            X_dataset = X[dataset_mask]
+            
+            if (dataset, pipeline_name) in self.scalers_ and self.scalers_[(dataset, pipeline_name)] is not None:
+                # Use pre-fitted scaler
+                X_normalized[dataset_mask] = self.scalers_[(dataset, pipeline_name)].transform(X_dataset)
+            else:
+                # If no scaler available (e.g., new dataset), use identity transformation
+                X_normalized[dataset_mask] = X_dataset
+        
+        return X_normalized
+
+def normalize_features(df, features, pipeline_name, datasets, fit_scaler=None):
+    """
+    Normalize features using z-score normalization per dataset
+    
+    Parameters:
+    - df: DataFrame containing the features
+    - features: List of feature columns to normalize
+    - pipeline_name: Name of the current pipeline (for tracking)
+    - datasets: Array of dataset identifiers
+    - fit_scaler: Optional pre-fitted DatasetPipelineScaler for transformation only
+    
+    Returns:
+    - Normalized DataFrame and fitted scaler
+    """
+    if len(features) == 0:
+        return df, fit_scaler
+    
+    # Extract feature matrix
+    X = df[features].values
+    
+    if fit_scaler is None:
+        # Fit new scaler
+        scaler = DatasetPipelineScaler()
+        scaler.fit(X, features, datasets, pipeline_name)
+        X_normalized = scaler.transform(X, features, datasets, pipeline_name)
+    else:
+        # Use pre-fitted scaler
+        X_normalized = fit_scaler.transform(X, features, datasets, pipeline_name)
+        scaler = fit_scaler
+    
+    # Create normalized DataFrame
+    df_normalized = df.copy()
+    df_normalized[features] = X_normalized
+    
+    return df_normalized, scaler
+
+# ----------------------------
 # Modeling Functions
 # ----------------------------
 
 def create_model_pipeline(model_type):
-    """Create a pipeline with the specified model (no scaling since data is pre-normalized)"""
+    """Create a pipeline with the specified model"""
     if model_type == 'elasticnet':
-        model = ElasticNet(random_state=42, max_iter=50000)  # Increased max_iter
+        model = ElasticNet(random_state=42, max_iter=50000)
         param_grid = ELASTIC_NET_PARAMS
-    elif model_type == 'ridge':
-        model = Ridge(random_state=42, max_iter=50000)
-        param_grid = RIDGE_PARAMS
-    elif model_type == 'lasso':
-        model = Lasso(random_state=42, max_iter=50000)
-        param_grid = LASSO_PARAMS
     elif model_type == 'randomforest':
         model = RandomForestRegressor(random_state=42)
         param_grid = RANDOM_FOREST_PARAMS
-    elif model_type == 'extratrees':  # NEW: Extra Trees
+    elif model_type == 'extratrees':
         model = ExtraTreesRegressor(random_state=42)
         param_grid = EXTRA_TREES_PARAMS
     elif model_type == 'gradientboosting':
@@ -205,7 +293,7 @@ def create_model_pipeline(model_type):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    # Create pipeline without scaler since data is already normalized
+    # Create pipeline (scaler is now handled separately to avoid data leakage)
     pipeline = Pipeline([
         ('regressor', model)
     ])
@@ -223,17 +311,31 @@ class EnsembleModel:
             predictions[:, i] = model.predict(X)
         return np.mean(predictions, axis=1)
 
-def nested_cv_evaluation(X, y, groups, model_type, pipeline_name):
-    """Perform nested CV with hyperparameter optimization"""
+def nested_cv_evaluation(df, model_type, pipeline_name):
+    """Perform nested CV with proper normalization to avoid data leakage"""
     print(f"  Evaluating {model_type} on {pipeline_name}...")
+    
+    # Get features for this pipeline
+    features = get_features_for_pipeline(df, pipeline_name)
+    
+    if len(features) == 0:
+        print(f"    WARNING: No features found for pipeline '{pipeline_name}'")
+        return [np.nan], []
     
     # Create model pipeline
     model_pipeline, param_grid = create_model_pipeline(model_type)
+    
+    # Prepare data
+    X = df[features]
+    y = df['age']
+    groups = df['subject_id']
+    datasets = df['dataset']
     
     # Convert to numpy arrays to avoid pandas issues
     X_array = X.values if hasattr(X, 'values') else X
     y_array = y.values if hasattr(y, 'values') else y
     groups_array = groups.values if hasattr(groups, 'values') else groups
+    datasets_array = datasets.values if hasattr(datasets, 'values') else datasets
     
     # Outer CV: 5-fold group split for evaluation
     outer_cv = GroupKFold(n_splits=5)
@@ -241,34 +343,55 @@ def nested_cv_evaluation(X, y, groups, model_type, pipeline_name):
     best_models = []
     
     for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_array, y_array, groups_array)):
+        print(f"    Fold {fold + 1}:", end=" ")
+        
+        # Split data
         X_train, X_test = X_array[train_idx], X_array[test_idx]
         y_train, y_test = y_array[train_idx], y_array[test_idx]
         groups_train = groups_array[train_idx]
+        datasets_train = datasets_array[train_idx]
+        datasets_test = datasets_array[test_idx]
+        
+        # Create temporary DataFrames for normalization
+        train_df = pd.DataFrame(X_train, columns=features)
+        train_df['dataset'] = datasets_train
+        test_df = pd.DataFrame(X_test, columns=features)
+        test_df['dataset'] = datasets_test
+        
+        # Normalize training data and fit scaler
+        train_normalized, scaler = normalize_features(train_df, features, pipeline_name, datasets_train)
+        
+        # Normalize test data using the scaler fitted on training data
+        test_normalized, _ = normalize_features(test_df, features, pipeline_name, datasets_test, fit_scaler=scaler)
+        
+        # Extract normalized arrays
+        X_train_norm = train_normalized[features].values
+        X_test_norm = test_normalized[features].values
         
         # Inner CV: 3-fold group split for hyperparameter tuning
         inner_cv = GroupKFold(n_splits=3)
         
         try:
-            # Grid search for hyperparameter optimization
+            # Grid search for hyperparameter optimization on normalized training data
             grid_search = GridSearchCV(
                 model_pipeline, param_grid, cv=inner_cv, 
                 scoring='neg_mean_absolute_error', n_jobs=-1,
-                error_score='raise'  # This will help identify issues
+                error_score='raise'
             )
-            grid_search.fit(X_train, y_train, groups=groups_train)
+            grid_search.fit(X_train_norm, y_train, groups=groups_train)
             
-            # Get best model and evaluate on test fold
+            # Get best model and evaluate on normalized test fold
             best_model = grid_search.best_estimator_
-            y_pred = best_model.predict(X_test)
+            y_pred = best_model.predict(X_test_norm)
             mae = mean_absolute_error(y_test, y_pred)
             
             outer_scores.append(mae)
             best_models.append(best_model)
             
-            print(f"    Fold {fold + 1}: MAE = {mae:.3f}, Best params: {grid_search.best_params_}")
+            print(f"MAE = {mae:.3f}, Best params: {grid_search.best_params_}")
             
         except Exception as e:
-            print(f"    Fold {fold + 1}: FAILED - {str(e)}")
+            print(f"FAILED - {str(e)}")
             # If a fold fails, we'll skip it but continue with others
             continue
     
@@ -307,22 +430,26 @@ def evaluate_ensemble(results_df, df):
     
     # Prepare data for ensemble
     groups = df['subject_id']
+    datasets = df['dataset']
     
     # Outer CV for ensemble evaluation
     outer_cv = GroupKFold(n_splits=5)
-    X_array = df.drop(['dataset', 'subject', 'session', 'age', 'subject_id'], axis=1).values
+    X_full = df.drop(['dataset', 'subject', 'session', 'age', 'subject_id'], axis=1)
     y_array = df['age'].values
     groups_array = groups.values
+    datasets_array = datasets.values
     
     outer_scores = []
     ensemble_models = []
     
-    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_array, y_array, groups_array)):
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_full, y_array, groups_array)):
         print(f"  Ensemble Fold {fold + 1}:")
         
-        X_train, X_test = X_array[train_idx], X_array[test_idx]
+        X_train_full, X_test_full = X_full.iloc[train_idx], X_full.iloc[test_idx]
         y_train, y_test = y_array[train_idx], y_array[test_idx]
         groups_train = groups_array[train_idx]
+        datasets_train = datasets_array[train_idx]
+        datasets_test = datasets_array[test_idx]
         
         # Train individual models on training data
         individual_models = []
@@ -334,16 +461,28 @@ def evaluate_ensemble(results_df, df):
             if len(features) == 0:
                 continue
                 
-            X_pipeline = df.iloc[train_idx][features].values
-            X_pipeline_test = df.iloc[test_idx][features].values
+            # Create temporary DataFrames for this pipeline's features
+            train_df_pipeline = pd.DataFrame(X_train_full[features].values, columns=features)
+            train_df_pipeline['dataset'] = datasets_train
+            
+            test_df_pipeline = pd.DataFrame(X_test_full[features].values, columns=features)
+            test_df_pipeline['dataset'] = datasets_test
+            
+            # Normalize training data
+            train_normalized, scaler = normalize_features(train_df_pipeline, features, pipeline, datasets_train)
+            X_pipeline_train = train_normalized[features].values
+            
+            # Normalize test data using training scaler
+            test_normalized, _ = normalize_features(test_df_pipeline, features, pipeline, datasets_test, fit_scaler=scaler)
+            X_pipeline_test = test_normalized[features].values
             
             # Create and train the model
             model_pipeline, param_grid = create_model_pipeline(model_type)
             
             # Simple training without hyperparameter tuning for speed
             try:
-                model_pipeline.fit(X_pipeline, y_train)
-                individual_models.append(model_pipeline)
+                model_pipeline.fit(X_pipeline_train, y_train)
+                individual_models.append((model_pipeline, pipeline, features, scaler))
                 print(f"    Trained {model_type} for {pipeline}")
             except Exception as e:
                 print(f"    Failed to train {model_type} for {pipeline}: {e}")
@@ -353,15 +492,17 @@ def evaluate_ensemble(results_df, df):
             print(f"    Not enough models trained for ensemble in fold {fold + 1}")
             continue
         
-        # Create ensemble and evaluate
-        ensemble = EnsembleModel(individual_models)
-        
         # Make ensemble prediction (simple average)
         all_predictions = []
-        for model in individual_models:
-            pipeline_features = get_features_for_pipeline(df.iloc[test_idx], 
-                                                         list(best_models_info.keys())[individual_models.index(model)])
-            X_pipeline_test = df.iloc[test_idx][pipeline_features].values
+        for model, pipeline, features, scaler in individual_models:
+            # Create test DataFrame for this pipeline
+            test_df_pipeline = pd.DataFrame(X_test_full[features].values, columns=features)
+            test_df_pipeline['dataset'] = datasets_test
+            
+            # Normalize test data using the scaler from training
+            test_normalized, _ = normalize_features(test_df_pipeline, features, pipeline, datasets_test, fit_scaler=scaler)
+            X_pipeline_test = test_normalized[features].values
+            
             pred = model.predict(X_pipeline_test)
             all_predictions.append(pred)
         
@@ -388,7 +529,7 @@ def main():
     print("BRAIN AGE PREDICTION ANALYSIS")
     print("=" * 60)
     
-    # Load data from new file
+    # Load data from new file - NOW WITHOUT PRE-NORMALIZATION
     df = load_and_preprocess_data('ml_dataset_with_age.csv')
     
     if len(df) == 0:
@@ -398,8 +539,8 @@ def main():
     # Prepare results storage
     results = []
     
-    # Define models to evaluate - UPDATED with new models
-    models_to_evaluate = ['elasticnet', 'ridge', 'lasso', 'randomforest', 'extratrees', 'gradientboosting', 'svm', 'mlp']
+    # Define models to evaluate - UPDATED: removed ridge and lasso, kept only elasticnet
+    models_to_evaluate = ['elasticnet', 'randomforest', 'extratrees', 'gradientboosting', 'svm', 'mlp']
     
     # Iterate through each pipeline configuration
     for pipeline_name in PIPELINES.keys():
@@ -415,16 +556,12 @@ def main():
             print(f"  WARNING: No features found for pipeline '{pipeline_name}'")
             continue
             
-        X = df[features]
-        y = df['age']
-        groups = df['subject_id']  # For group-based splitting
+        print(f"Features: {len(features)}, Samples: {len(df)}, Subjects: {len(df['subject_id'].unique())}")
         
-        print(f"Features: {len(features)}, Samples: {len(X)}, Subjects: {len(groups.unique())}")
-        
-        # Evaluate all model types
+        # Evaluate all model types with proper nested CV normalization
         for model_type in models_to_evaluate:
-            # Perform nested CV
-            scores, models = nested_cv_evaluation(X, y, groups, model_type, pipeline_name)
+            # Perform nested CV with proper normalization
+            scores, models = nested_cv_evaluation(df, model_type, pipeline_name)
             
             # Only store results if we have valid scores
             if scores and not all(np.isnan(scores)):
@@ -439,8 +576,8 @@ def main():
                         'mean_mae': mean_mae,
                         'std_mae': std_mae,
                         'n_features': len(features),
-                        'n_samples': len(X),
-                        'n_subjects': len(groups.unique()),
+                        'n_samples': len(df),
+                        'n_subjects': len(df['subject_id'].unique()),
                         'successful_folds': len(valid_scores)
                     })
                     
