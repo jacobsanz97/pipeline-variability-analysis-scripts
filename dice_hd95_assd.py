@@ -86,14 +86,13 @@ def dice_per_label(arr1, arr2, labels):
         dices[lbl] = 1.0 if v1+v2 == 0 else 2*inter/(v1+v2)
     return dices
 
-# Fast HD95 using SimpleITK
 def fast_hd95_per_label(arr1, arr2, labels, voxel_spacing):
-    """Compute HD95 using SimpleITK's optimized implementation"""
+    """Compute proper HD95 using boundary distance percentiles"""
     if not SITK_AVAILABLE:
         return {lbl: np.nan for lbl in labels}
     
     hd95s = {}
-    spacing_sitk = voxel_spacing[::-1]  # SimpleITK uses z,y,x order
+    spacing_sitk = voxel_spacing[::-1]
     
     for lbl in labels:
         m1 = arr1 == lbl
@@ -109,9 +108,33 @@ def fast_hd95_per_label(arr1, arr2, labels, voxel_spacing):
             sitk1.SetSpacing(spacing_sitk)
             sitk2.SetSpacing(spacing_sitk)
             
-            hd95_filter = sitk.HausdorffDistanceImageFilter()
-            hd95_filter.Execute(sitk1, sitk2)
-            hd95 = hd95_filter.GetAverageHausdorffDistance()  # This is HD95!
+            # Get boundaries
+            contour1 = sitk.BinaryContour(sitk1, fullyConnected=False)
+            contour2 = sitk.BinaryContour(sitk2, fullyConnected=False)
+            
+            # Compute distance transforms
+            dt1 = sitk.SignedMaurerDistanceMap(contour1, useImageSpacing=True, squaredDistance=False)
+            dt2 = sitk.SignedMaurerDistanceMap(contour2, useImageSpacing=True, squaredDistance=False)
+            
+            # Convert to arrays
+            dt1_arr = sitk.GetArrayFromImage(dt1)
+            dt2_arr = sitk.GetArrayFromImage(dt2)
+            contour1_arr = sitk.GetArrayFromImage(contour1)
+            contour2_arr = sitk.GetArrayFromImage(contour2)
+            
+            # Get distances between boundaries
+            dist1_to_2 = np.abs(dt2_arr[contour1_arr > 0])
+            dist2_to_1 = np.abs(dt1_arr[contour2_arr > 0])
+            
+            if len(dist1_to_2) == 0 or len(dist2_to_1) == 0:
+                hd95s[lbl] = np.nan
+                continue
+            
+            # Compute HD95 as max of 95th percentiles in both directions
+            hd95_1_to_2 = np.percentile(dist1_to_2, 95) if len(dist1_to_2) > 0 else 0
+            hd95_2_to_1 = np.percentile(dist2_to_1, 95) if len(dist2_to_1) > 0 else 0
+            hd95 = max(hd95_1_to_2, hd95_2_to_1)
+            
             hd95s[lbl] = hd95
             
         except Exception as e:
@@ -176,7 +199,8 @@ def load_segmentation_as_int(path, ref_img=None):
     if ref_img is not None and (img.shape != ref_img.shape or not np.allclose(img.affine, ref_img.affine, atol=1e-3)):
         img = resample_from_to(img, ref_img, order=0)
     data = img.get_fdata(dtype=np.float32).astype(np.int16)
-    return data, img.affine  # Return both data and affine for voxel spacing
+    # MODIFIED: return the full NIfTI image object (img) for potential later resampling
+    return data, img.affine, img
 
 def count_unique_subjects(df):
     """Count unique subjects across datasets (dataset + subject combination)"""
@@ -218,9 +242,89 @@ def get_heatmap_range(df, metric, dataset=None):
     print(f"  {metric} heatmap range: {vmin:.3f}-{vmax:.3f} (means: {mean_min:.3f}-{mean_max:.3f})")
     return vmin, vmax
 
-def main(n_subjects=10, parallel=False, max_threads=10, metrics=None):
+# Define a function to compute metrics for one subject (now outside the loop for ThreadPoolExecutor)
+def compute_for_subject(uid, ref_img, downsample_factor, metrics, pairs, dataset, STRUCTURE_LABELS, LABELS, PIPELINES, subj_maps):
+    _, sub, ses = uid.split("__")
+    high_res_imgs = {}
+    
+    # 1. LOAD/RESAMPLE TO HIGH-RESOLUTION SPACE (for Dice)
+    # Calculate high-res spacing using the affine from the high-res reference image
+    high_res_spacing = np.sqrt(np.sum(ref_img.affine[:3,:3]**2, axis=0))
+    # Keep track of the high-res image objects for potential second resampling
+    high_res_img_objects = {} 
+    
+    for pl in PIPELINES:
+        # Load and resample to the high-res reference grid
+        # load_segmentation_as_int now returns the Nifti image object (img)
+        data, _, img_obj = load_segmentation_as_int(subj_maps[pl][uid], ref_img)
+        high_res_imgs[pl] = data
+        high_res_img_objects[pl] = img_obj
+        
+    low_res_imgs = None
+    low_res_spacing = None
+    
+    # 2. CONDITIONAL DOWNGRADING FOR HD95/ASSD ONLY
+    is_distance_metric_needed = any(m in metrics for m in ['assd', 'hd95'])
+
+    if downsample_factor > 1.0 and is_distance_metric_needed:
+        # A. Define the new low-resolution space (Affine/Header) based on the high-res ref_img
+        ds_affine = ref_img.affine.copy()
+        ds_affine[:3,:3] *= downsample_factor
+        ds_shape = (np.array(ref_img.shape[:3]) // downsample_factor).astype(int)
+        ds_ref_img = nib.Nifti1Image(np.zeros(ds_shape), ds_affine)
+        low_res_spacing = np.sqrt(np.sum(ds_ref_img.affine[:3,:3]**2, axis=0))
+
+        low_res_imgs = {}
+        
+        # B. Resample the already loaded high-res data to the low-res space
+        for pl in PIPELINES:
+            # Resample from high-res object to low-res target
+            ds_img = resample_from_to(high_res_img_objects[pl], ds_ref_img, order=0)
+            low_res_imgs[pl] = ds_img.get_fdata(dtype=np.float32).astype(np.int16)
+    
+    # 3. METRIC COMPUTATION
+    local_results = []
+    for p1, p2 in pairs:
+        metric_results = {}
+        
+        # DICE: Always use high-resolution data
+        if 'dice' in metrics:
+            metric_results['dice'] = dice_per_label(high_res_imgs[p1], high_res_imgs[p2], LABELS)
+        
+        # HD95/ASSD: Use low-res data if available, else fall back to high-res (slow)
+        if 'assd' in metrics:
+            arr1 = low_res_imgs[p1] if low_res_imgs is not None else high_res_imgs[p1]
+            arr2 = low_res_imgs[p2] if low_res_imgs is not None else high_res_imgs[p2]
+            # FIX: Check explicitly for None, as low_res_spacing is a NumPy array
+            spacing = low_res_spacing if low_res_spacing is not None else high_res_spacing
+            metric_results['assd'] = assd_per_label(arr1, arr2, LABELS, spacing)
+        
+        if 'hd95' in metrics:
+            arr1 = low_res_imgs[p1] if low_res_imgs is not None else high_res_imgs[p1]
+            arr2 = low_res_imgs[p2] if low_res_imgs is not None else high_res_imgs[p2]
+            # FIX: Check explicitly for None, as low_res_spacing is a NumPy array
+            spacing = low_res_spacing if low_res_spacing is not None else high_res_spacing
+            metric_results['hd95'] = fast_hd95_per_label(arr1, arr2, LABELS, spacing)
+            
+        for name, lbl in STRUCTURE_LABELS.items():
+            result_row = {
+                "dataset": dataset, "subject": sub, "session": ses,
+                "pipeline1": p1, "pipeline2": p2,
+                "structure": name, "label": lbl
+            }
+            for metric in metrics:
+                if metric in metric_results and lbl in metric_results[metric]:
+                     result_row[metric] = metric_results[metric][lbl]
+                else:
+                     result_row[metric] = np.nan
+                     
+            local_results.append(result_row)
+    return local_results
+
+
+def main(n_subjects=10, parallel=False, max_threads=10, metrics=None, downsample_factor=1.0):
     if metrics is None:
-        metrics = ['dice', 'assd', 'hd95']
+        metrics = ['dice']
     
     ROOT_DIR = os.path.expanduser("~/Desktop/duckysets")
 
@@ -261,54 +365,25 @@ def main(n_subjects=10, parallel=False, max_threads=10, metrics=None):
         # pipeline pairs
         pairs = [(a,b) for i,a in enumerate(PIPELINES) for b in list(PIPELINES)[i+1:]]
 
-        # pick first pipeline as reference for resampling
-        ref_img = nib.load(subj_maps[list(PIPELINES.keys())[0]][common[0]])
+        # pick first pipeline as reference for resampling (HIGH-RESOLUTION REFERENCE)
+        ref_img = nib.load(subj_maps[list(PIPELINES.keys())[0]][common[0]]) 
+        
+        if downsample_factor > 1.0:
+            print(f"Downsampling factor {downsample_factor} will be applied to HD95/ASSD only.")
 
-        # function to compute metrics for one subject
-        def compute_for_subject(uid):
-            _, sub, ses = uid.split("__")
-            imgs = {}
-            affines = {}
-            for pl in PIPELINES:
-                data, affine = load_segmentation_as_int(subj_maps[pl][uid], ref_img)
-                imgs[pl] = data
-                affines[pl] = affine
-            
-            # Calculate voxel spacing from affine matrix
-            voxel_spacing = np.sqrt(np.sum(ref_img.affine[:3,:3]**2, axis=0))
-            
-            local_results = []
-            for p1, p2 in pairs:
-                metric_results = {}
-                
-                if 'dice' in metrics:
-                    metric_results['dice'] = dice_per_label(imgs[p1], imgs[p2], LABELS)
-                
-                if 'assd' in metrics:
-                    metric_results['assd'] = assd_per_label(imgs[p1], imgs[p2], LABELS, voxel_spacing)
-                
-                if 'hd95' in metrics:
-                    metric_results['hd95'] = fast_hd95_per_label(imgs[p1], imgs[p2], LABELS, voxel_spacing)
-                
-                for name, lbl in STRUCTURE_LABELS.items():
-                    result_row = {
-                        "dataset": dataset, "subject": sub, "session": ses,
-                        "pipeline1": p1, "pipeline2": p2,
-                        "structure": name, "label": lbl
-                    }
-                    for metric in metrics:
-                        result_row[metric] = metric_results[metric][lbl]
-                    local_results.append(result_row)
-            return local_results
-
+        # Prepare partial function for ThreadPoolExecutor
+        compute_for_subject_partial = lambda uid: compute_for_subject(
+            uid, ref_img, downsample_factor, metrics, pairs, dataset, STRUCTURE_LABELS, LABELS, PIPELINES, subj_maps
+        )
+        
         if parallel:
             with ThreadPoolExecutor(max_workers=max_threads) as exe:
-                for r in tqdm(exe.map(compute_for_subject, common), total=len(common),
+                for r in tqdm(exe.map(compute_for_subject_partial, common), total=len(common),
                               desc=f"Metric computation ({dataset})"):
                     results.extend(r)
         else:
             for uid in tqdm(common, desc=f"Metric computation ({dataset})"):
-                results.extend(compute_for_subject(uid))
+                results.extend(compute_for_subject_partial(uid)) # Use partial func
 
     # save tidy CSV
     df = pd.DataFrame(results)
@@ -450,5 +525,7 @@ if __name__=="__main__":
                    help="Maximum number of subjects processed concurrently in parallel")
     p.add_argument("--metrics", nargs="+", choices=['dice', 'assd', 'hd95'], default=['dice'],
                    help="Metrics to compute (default: dice only for speed)")
+    p.add_argument("--downsample_factor", type=float, default=1.0, 
+                   help="Factor to downsample ONLY HD95/ASSD images. E.g., 2.0 halves the resolution. Use 1.0 for no downsampling.")
     a = p.parse_args()
-    main(a.n_subjects, a.parallel, a.max_threads, a.metrics)
+    main(a.n_subjects, a.parallel, a.max_threads, a.metrics, a.downsample_factor)
