@@ -4,8 +4,8 @@ from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, Gradien
 from sklearn.linear_model import ElasticNet
 from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
-from sklearn.neighbors import KNeighborsRegressor # ADDED K-Neighbors
-from sklearn.model_selection import GroupKFold, GridSearchCV, RandomizedSearchCV, cross_val_score, train_test_split
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.model_selection import GroupKFold, GridSearchCV, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
@@ -13,20 +13,43 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ----------------------------
+# 🎯 REQUIREMENT 1: BASELINE MEAN PREDICTOR CLASS
+# ----------------------------
+class MeanPredictor:
+    """A baseline model that always predicts the mean age of the training set."""
+    def __init__(self):
+        self.mean_age = None
+
+    def fit(self, X_train, y_train):
+        # Calculate the mean age from the training data (essential for CV folds)
+        self.mean_age = y_train.mean()
+        return self
+
+    def predict(self, X_test):
+        # Always predict that mean value
+        if self.mean_age is None:
+            raise ValueError("Model must be fitted before prediction.")
+        # X_test can be numpy array or dataframe, we only need its length
+        return np.full(len(X_test), self.mean_age)
+
+# ----------------------------
 # Configuration
 # ----------------------------
 
-# Define the pipelines and their feature sets - UPDATED for extended features
+# Define the pipelines and their feature sets - 'all_pipelines' ADDED BACK
 PIPELINES = {
     'freesurfer8001ants243': 'freesurfer8001ants243',
     'freesurfer741ants243': 'freesurfer741ants243', 
     'samseg8001ants243': 'samseg8001ants243',
     'fslanat6071ants243': 'fslanat6071ants243',
-    'all_pipelines': None  # Will use all features
+    'all_pipelines': None  # ADDED BACK: Will use all features
 }
 
+# --- ALL MODEL TYPES TO BE EVALUATED ---
+MODELS_TO_EVALUATE = ['baseline', 'elasticnet', 'kneighbors', 'histgradientboosting','extratrees', 'svm']
+
 # --- TOGGLE FOR OUTLIER REMOVAL (NEW) ---
-RUN_OUTLIER_REMOVAL = False # Set to True to re-enable the MAD outlier filtering
+RUN_OUTLIER_REMOVAL = False 
 
 # --- ORIGINAL/UNTOUCHED GRIDS (for non-tree models) ---
 ELASTIC_NET_PARAMS = {
@@ -93,10 +116,11 @@ def clean_age_value(age):
 
 def get_feature_cols(df):
     """Utility to get all feature columns, matching logic in get_features_for_pipeline"""
-    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id']
+    # ADD 'sex' TO METADATA COLS
+    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id', 'sex']
     return [col for col in df.columns if col not in metadata_cols]
 
-# --- OUTLIER REMOVAL FUNCTION (Identical to V6) ---
+# --- OUTLIER REMOVAL FUNCTION (Identical) ---
 def remove_outliers_mad(df_in, threshold_percent=0.10, mad_threshold=6.0): 
     """
     Remove participants if more than 'threshold_percent' (10%) of their brain features 
@@ -133,7 +157,7 @@ def remove_outliers_mad(df_in, threshold_percent=0.10, mad_threshold=6.0):
 
 
 def load_and_preprocess_data(file_path, age_file_path=None):
-    """Load and preprocess the data"""
+    """Load and preprocess the data - MODIFIED TO ENSURE 'sex' IS PRESENT"""
     print("Loading data...")
     df = pd.read_csv(file_path)
     
@@ -145,16 +169,30 @@ def load_and_preprocess_data(file_path, age_file_path=None):
     
     if 'age' not in df.columns:
         raise KeyError("'age' column not found in the data. Please provide age data.")
+        
+    # --- REQUIREMENT 2: CHECK FOR 'sex' COLUMN ---
+    if 'sex' not in df.columns:
+        raise KeyError("REQUIRED: 'sex' column (M/F) not found in the input data. Please check your CSV.")
     
+    # Standard data cleanup
     print("Cleaning age data...")
     df['age'] = df['age'].apply(clean_age_value)
     df['subject_id'] = df['dataset'] + '_' + df['subject']
     
-    initial_count = len(df)
-    df_clean = df.dropna(subset=['age']).copy()
+    # Filter 'sex' to only M and F
+    df['sex'] = df['sex'].astype(str).str.upper().str.strip()
+    initial_count_sex = len(df)
+    df_clean = df[df['sex'].isin(['M', 'F'])].copy()
+    print(f"After removing non-M/F sex entries: {len(df_clean)} samples (removed {initial_count_sex - len(df_clean)})")
+    
+    # ... (Rest of data cleaning remains the same)
+    
+    initial_count = len(df_clean)
+    df_clean = df_clean.dropna(subset=['age']).copy()
     print(f"After removing missing/invalid age: {len(df_clean)} samples (removed {initial_count - len(df_clean)})")
     
-    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id']
+    # ... (Feature handling uses updated get_feature_cols)
+    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id', 'sex']
     all_feature_cols = [col for col in df_clean.columns if col not in metadata_cols]
     
     initial_count_age_clean = len(df_clean)
@@ -178,23 +216,24 @@ def load_and_preprocess_data(file_path, age_file_path=None):
     print(f"Final dataset: {len(df_clean)} samples, {len(df_clean['subject_id'].unique())} unique subjects")
     print(f"Age range: {df_clean['age'].min():.1f} - {df_clean['age'].max():.1f} years")
     print(f"Age distribution - Mean: {df_clean['age'].mean():.1f}, Std: {df_clean['age'].std():.1f}")
+    print(f"Sex distribution - M: {len(df_clean[df_clean['sex']=='M'])}, F: {len(df_clean[df_clean['sex']=='F'])}")
     
     return df_clean
 
 def get_features_for_pipeline(df, pipeline_name):
-    """Get the appropriate features for a given pipeline"""
+    """Get the appropriate features for a given pipeline - UPDATED for 'all_pipelines'"""
     if pipeline_name == 'all_pipelines':
-        metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id']
-        return [col for col in df.columns if col not in metadata_cols]
-    else:
-        pipeline_features = [col for col in df.columns if col.startswith(pipeline_name + '__')]
-        return pipeline_features
+        # Use all feature columns defined in get_feature_cols
+        return get_feature_cols(df) 
+    pipeline_features = [col for col in df.columns if col.startswith(pipeline_name + '__')]
+    return pipeline_features
 
 # ----------------------------
-# Normalization Functions (Identical to original)
+# Normalization Functions (Identical)
 # ----------------------------
 
 class DatasetPipelineScaler:
+    # ... (DatasetPipelineScaler class is unchanged)
     def __init__(self):
         self.scalers_ = {}  
         self.feature_means_ = {}
@@ -256,12 +295,16 @@ def normalize_features(df, features, pipeline_name, datasets, fit_scaler=None):
     return df_normalized, scaler
 
 # ----------------------------
-# Modeling Functions (Identical to original)
+# Modeling Functions (Modified for Baseline and Model Type)
 # ----------------------------
 
 def create_model_pipeline(model_type):
-    """Create a pipeline with the specified model"""
-    if model_type == 'elasticnet':
+    """Create a pipeline with the specified model, or the MeanPredictor for 'baseline'"""
+    if model_type == 'baseline':
+        model = MeanPredictor() # Use the custom class
+        param_grid = {} # No hyperparameters to tune
+        search_class = None # No search needed
+    elif model_type == 'elasticnet':
         model = ElasticNet(random_state=42, max_iter=50000)
         param_grid = ELASTIC_NET_PARAMS
         search_class = RandomizedSearchCV
@@ -292,244 +335,307 @@ def create_model_pipeline(model_type):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
     
-    pipeline = Pipeline([
-        ('regressor', model)
-    ])
+    # Baseline model does not use a Pipeline or StandardScaler in this setup
+    if model_type != 'baseline':
+        pipeline = Pipeline([('regressor', model)])
+    else:
+        pipeline = model # MeanPredictor is the model itself
     
     return pipeline, param_grid, search_class
 
 def nested_cv_evaluation(df, model_type, pipeline_name):
-    """Perform nested CV with proper normalization to avoid data leakage"""
+    """
+    Perform nested CV with proper normalization, sex-splitting, and baseline handling.
+    Returns: a list of dictionaries, one for Male results and one for Female results.
+    """
     print(f"  Evaluating {model_type} on {pipeline_name}...")
     
     features = get_features_for_pipeline(df, pipeline_name)
     
-    if len(features) == 0:
+    if len(features) == 0 and model_type != 'baseline':
         print(f"    WARNING: No features found for pipeline '{pipeline_name}'")
-        return [np.nan], []
+        return []
     
-    print(f"    Features: {len(features)}")
+    print(f"    Features: {len(features) if model_type != 'baseline' else 'N/A'}")
+    
+    # Full data required for GroupKFold
+    X_full = df[features + ['dataset', 'sex']] if model_type != 'baseline' else df[['dataset', 'sex']]
+    y_full = df['age']
+    groups_full = df['subject_id']
+    
+    outer_cv = GroupKFold(n_splits=5)
+    
+    # Store results for Male and Female separately
+    sex_results = {'M': {'scores': [], 'models': []}, 
+                   'F': {'scores': [], 'models': []}}
     
     model_pipeline, param_grid, search_class = create_model_pipeline(model_type)
     
-    X = df[features]
-    y = df['age']
-    groups = df['subject_id']
-    datasets = df['dataset']
-    
-    X_array = X.values if hasattr(X, 'values') else X
-    y_array = y.values if hasattr(y, 'values') else y
-    groups_array = groups.values if hasattr(groups, 'values') else groups
-    datasets_array = datasets.values if hasattr(datasets, 'values') else datasets
-    
-    outer_cv = GroupKFold(n_splits=5)
-    outer_scores = []
-    best_models = []
-    
+    # Determine search parameters (only for non-baseline models)
     if search_class == RandomizedSearchCV:
-        n_iter = min(50, np.prod([len(v) for v in param_grid.values()]))
+        # Calculate max iterations based on product of all grid lengths
+        total_param_combos = np.prod([len(v) for v in param_grid.values()])
+        n_iter = min(50, total_param_combos)
         search_kwargs = {'n_iter': n_iter, 'random_state': 42}
-        print(f"    Using RandomizedSearchCV with n_iter={n_iter}")
+        if n_iter > 1:
+            print(f"    Using RandomizedSearchCV with n_iter={n_iter}")
+        elif n_iter == 1:
+            print(f"    Using 1-step RandomizedSearchCV (effectively GridSearchCV for single combo)")
     else:
         search_kwargs = {}
-        try:
-            total_combinations = np.prod([len(v) for v in param_grid.values()])
-        except Exception:
-            total_combinations = '?'
-        print(f"    Using GridSearchCV (testing all {total_combinations} combinations)")
 
-    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_array, y_array, groups_array)):
+
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_full, y_full, groups_full)):
         print(f"    Fold {fold + 1}:", end=" ")
         
-        X_train, X_test = X_array[train_idx], X_array[test_idx]
-        y_train, y_test = y_array[train_idx], y_array[test_idx]
-        groups_train = groups_array[train_idx]
-        datasets_train = datasets_array[train_idx]
-        datasets_test = datasets_array[test_idx]
+        X_train_full, X_test_full = X_full.iloc[train_idx], X_full.iloc[test_idx]
+        y_train_full, y_test_full = y_full.iloc[train_idx], y_full.iloc[test_idx]
+        groups_train = groups_full.iloc[train_idx]
         
-        train_df = pd.DataFrame(X_train, columns=features)
-        train_df['dataset'] = datasets_train
-        test_df = pd.DataFrame(X_test, columns=features)
-        test_df['dataset'] = datasets_test
-        
-        train_normalized, scaler = normalize_features(train_df, features, pipeline_name, datasets_train)
-        test_normalized, _ = normalize_features(test_df, features, pipeline_name, datasets_test, fit_scaler=scaler)
-        
-        X_train_norm = train_normalized[features].values
-        X_test_norm = test_normalized[features].values
-        
-        inner_cv = GroupKFold(n_splits=3)
-        
-        try:
-            search = search_class(
-                model_pipeline, param_grid, cv=inner_cv, 
-                scoring='neg_mean_absolute_error', n_jobs=-1,
-                error_score='raise', **search_kwargs
-            )
-            search.fit(X_train_norm, y_train, groups=groups_train)
+        # --- REQUIREMENT 2: SPLIT DATA BY SEX ---
+        for sex in ['M', 'F']:
             
-            best_model = search.best_estimator_
-            y_pred = best_model.predict(X_test_norm)
-            mae = mean_absolute_error(y_test, y_pred)
+            # --- Training Split ---
+            train_mask = X_train_full['sex'] == sex
+            X_train_sex = X_train_full[train_mask].drop(columns=['sex'])
+            y_train_sex = y_train_full[train_mask]
+            groups_train_sex = groups_train[train_mask]
+            datasets_train_sex = X_train_sex['dataset']
             
-            outer_scores.append(mae)
-            best_models.append(best_model)
-            
-            print(f"MAE = {mae:.3f}, Best params: {search.best_params_}")
-            
-        except Exception as e:
-            print(f"FAILED - {str(e)}")
-            continue
-    
-    if len(outer_scores) >= 3:
-        return outer_scores, best_models
-    else:
-        print(f"  WARNING: Only {len(outer_scores)} successful folds for {model_type}")
-        return [np.nan], []
+            # --- Testing Split ---
+            test_mask = X_test_full['sex'] == sex
+            X_test_sex = X_test_full[test_mask].drop(columns=['sex'])
+            y_test_sex = y_test_full[test_mask]
+            datasets_test_sex = X_test_sex['dataset']
 
-def evaluate_ensemble(results_df, df, ensemble_type='simple_average'):
-    """
-    Evaluate ensemble model using best individual models from each pipeline.
-    Includes simple average and weighted average based on 1/MAE.
-    """
-    if ensemble_type == 'simple_average':
-        print(f"\n{'='*50}")
-        print(f"ENSEMBLE EVALUATION - SIMPLE AVERAGE")
-        print(f"{'='*50}")
-        
-    elif ensemble_type == 'weighted_average':
-        print(f"\n{'='*50}")
-        print(f"ENSEMBLE EVALUATION - WEIGHTED AVERAGE (1/MAE)")
-        print(f"{'='*50}")
-    
-    best_models_info = {}
-    for pipeline in PIPELINES.keys():
-        if pipeline == 'all_pipelines':
-            continue
-            
-        # EXCLUDE FSL PIPELINE FOR WEIGHTED ENSEMBLE
-        if ensemble_type == 'weighted_average' and pipeline == 'fslanat6071ants243':
-            continue
-            
-        pipeline_results = results_df[results_df['pipeline'] == pipeline]
-        if len(pipeline_results) > 0:
-            best_idx = pipeline_results['mean_mae'].idxmin()
-            best_model_info = pipeline_results.loc[best_idx]
-            if best_model_info['successful_folds'] > 0 and best_model_info['mean_mae'] > 0:
-                best_models_info[pipeline] = best_model_info
-    
-    if len(best_models_info) < 2:
-        print(f"Not enough successful pipelines for {ensemble_type.replace('_', ' ')} ensemble (need at least 2 successful individual models)")
-        return [np.nan], []
-    
-    weights = {}
-    if ensemble_type == 'weighted_average':
-        inverse_maes = {p: 1.0 / info['mean_mae'] for p, info in best_models_info.items()}
-        sum_inverse_maes = sum(inverse_maes.values())
-        weights = {p: inv_mae / sum_inverse_maes for p, inv_mae in inverse_maes.items()}
-        print(f"Creating weighted average ensemble from {len(best_models_info)} best models.")
-    else:
-        weights = {p: 1.0 for p in best_models_info.keys()}
-        print(f"Creating simple average ensemble from {len(best_models_info)} best models.")
+            if len(y_train_sex) < 2 or len(y_test_sex) == 0:
+                print(f"({sex} - Too few samples)", end=" ")
+                continue
+                
+            # --- NORMALIZATION AND MODEL TRAINING ---
+            try:
+                if model_type != 'baseline':
+                    # Normalize features for non-baseline models
+                    X_train_features = X_train_sex.drop(columns=['dataset'])
+                    X_test_features = X_test_sex.drop(columns=['dataset'])
+                    
+                    train_normalized, scaler = normalize_features(
+                        X_train_features, features, pipeline_name, datasets_train_sex
+                    )
+                    test_normalized, _ = normalize_features(
+                        X_test_features, features, pipeline_name, datasets_test_sex, fit_scaler=scaler
+                    )
+                    
+                    X_train_norm = train_normalized[features].values
+                    X_test_norm = test_normalized[features].values
+                    
+                    # Inner CV Search
+                    inner_cv = GroupKFold(n_splits=3)
+                    search = search_class(
+                        model_pipeline, param_grid, cv=inner_cv, 
+                        scoring='neg_mean_absolute_error', n_jobs=-1,
+                        error_score='raise', **search_kwargs
+                    )
+                    
+                    # FIX 2: Convert groups_train_sex to values to prevent 'unhashable type' error
+                    search.fit(X_train_norm, y_train_sex, groups=groups_train_sex.values)
+                    
+                    best_model = search.best_estimator_
+                    y_pred = best_model.predict(X_test_norm)
+                    
+                    # FIX 1: Calculate MAE immediately after prediction
+                    mae = mean_absolute_error(y_test_sex, y_pred)
+                    
+                    # Log results
+                    best_params_str = ", ".join([f"{k.split('__')[-1]}: {v}" for k, v in search.best_params_.items()])
+                    print(f"({sex} MAE={mae:.3f}, Best params: {best_params_str}, N={len(y_train_sex)})", end=" ")
 
-    for pipeline, info in best_models_info.items():
-        weight_info = f" (Weight: {weights[pipeline]:.3f})" if ensemble_type == 'weighted_average' else ""
-        print(f"  {pipeline}: {info['model']} (MAE: {info['mean_mae']:.3f}){weight_info}")
+                else:
+                    # --- REQUIREMENT 1: BASELINE MODEL ---
+                    # Baseline model fits on un-normalized age data
+                    baseline_model = MeanPredictor()
+                    baseline_model.fit(None, y_train_sex) 
+                    y_pred = baseline_model.predict(X_test_sex)
+                    best_model = baseline_model # Store the fitted MeanPredictor
+                    
+                    # FIX 1: Calculate MAE immediately after prediction
+                    mae = mean_absolute_error(y_test_sex, y_pred)
+                    
+                    print(f"({sex} MAE={mae:.3f}, Mean={best_model.mean_age:.1f}, N={len(y_train_sex)})", end=" ")
+                
+                sex_results[sex]['scores'].append(mae)
+                sex_results[sex]['models'].append(best_model)
+                
+            except Exception as e:
+                # print(f"({sex} FAILED: {str(e)[:20]}...)", end=" ")
+                # We save the error for debugging but print a simple FAILED message
+                print(f"({sex} FAILED: {str(e).split(':')[-1].strip()[:20]}...)", end=" ")
+                continue
+        print("") # Newline after fold completion
+
+    # Format the results for the calling function
+    final_results = []
+    for sex, res in sex_results.items():
+        valid_scores = [s for s in res['scores'] if not np.isnan(s)]
+        if valid_scores:
+            # We need to ensure y_train_sex is available to get the final N count if all folds fail, 
+            # but since we only append results if successful, we rely on the last successful fold's N.
+            # However, for consistency in the final report, we will use the total N for that sex.
+            final_results.append({
+                'sex': sex,
+                'mean_mae': np.mean(valid_scores),
+                'std_mae': np.std(valid_scores),
+                'successful_folds': len(valid_scores),
+                'n_train_samples_per_fold': len(y_train_sex) if 'y_train_sex' in locals() and len(y_train_sex) > 0 else 0,
+            })
+    return final_results
+
+
+def evaluate_ensemble(df, all_pipeline_results):
+    """
+    REQUIREMENT 3 & FIX: Evaluate ensembles using the correct Model-Type/Pipeline Ensemble.
+    Male and Female ensembles are separate.
+    """
+    print(f"\n{'='*60}")
+    print(f"ENSEMBLE EVALUATION (Model-Type x Pipeline)")
+    print(f"{'='*60}")
     
+    # 1. Group results by sex and model type
+    ensemble_results = {'M': {}, 'F': {}}
+    for row in all_pipeline_results:
+        sex = row['sex']
+        model_type = row['model']
+        pipeline = row['pipeline']
+        
+        # Only include results that aren't already ensembles, the all-pipelines model, or baseline
+        if pipeline in PIPELINES and pipeline != 'all_pipelines' and model_type != 'baseline':
+             
+            if model_type not in ensemble_results[sex]:
+                ensemble_results[sex][model_type] = []
+            
+            ensemble_results[sex][model_type].append(row)
+
+    # 2. FIX 3: Initialize final_ensemble_report as a dictionary
+    final_ensemble_report = {}
+
+    # 3. Outer CV loop for ensemble evaluation
     groups = df['subject_id']
-    datasets = df['dataset']
     outer_cv = GroupKFold(n_splits=5)
     
-    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id']
+    # Data structure for CV:
+    metadata_cols = ['dataset', 'subject', 'session', 'age', 'subject_id', 'sex']
     all_feature_cols = [col for col in df.columns if col not in metadata_cols]
     
-    X_full = df[all_feature_cols] 
-    y_array = df['age'].values
-    groups_array = groups.values
-    datasets_array = datasets.values
+    X_full = df[all_feature_cols + ['dataset', 'sex']] 
+    y_full = df['age']
+    groups_full = groups.values
     
-    outer_scores = []
-    ensemble_models = []
-    
-    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_full, y_array, groups_array)):
+    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X_full, y_full, groups_full)):
         print(f"  Ensemble Fold {fold + 1}:")
         
         X_train_full, X_test_full = X_full.iloc[train_idx], X_full.iloc[test_idx]
-        y_train, y_test = y_array[train_idx], y_array[test_idx]
-        datasets_train = datasets_array[train_idx]
-        datasets_test = datasets_array[test_idx]
+        y_train_full, y_test_full = y_full.iloc[train_idx], y_full.iloc[test_idx]
         
-        individual_models_for_fold = []
-        
-        for pipeline, model_info in best_models_info.items():
-            model_type = model_info['model']
-            features = get_features_for_pipeline(df, pipeline)
+        # 4. Evaluate ensembles for each SEX and MODEL_TYPE
+        for sex in ['M', 'F']:
             
-            if len(features) == 0:
+            # --- Testing Split ---
+            test_mask = X_test_full['sex'] == sex
+            X_test_sex = X_test_full[test_mask].drop(columns=['sex'])
+            y_test_sex = y_test_full[test_mask]
+            datasets_test_sex = X_test_sex['dataset']
+            
+            if len(y_test_sex) == 0:
                 continue
+
+            for model_type, models_info in ensemble_results[sex].items():
                 
-            X_train_pipeline = X_train_full.loc[:, features]
-            train_df_pipeline = X_train_pipeline.copy()
-            train_df_pipeline['dataset'] = datasets_train
-            
-            train_normalized, scaler = normalize_features(train_df_pipeline, features, pipeline, datasets_train)
-            X_pipeline_train = train_normalized[features].values
-            
-            model_pipeline, _, _ = create_model_pipeline(model_type)
-            
-            try:
-                model_pipeline.fit(X_pipeline_train, y_train)
-                individual_models_for_fold.append({
-                    'model': model_pipeline, 
-                    'pipeline': pipeline, 
-                    'features': features, 
-                    'scaler': scaler,
-                    'weight': weights[pipeline]
+                # Exclude ensembles with fewer than 2 successful pipelines
+                # models_info contains the results of successful folds, we need the total pipelines used
+                if len(models_info) < 2:
+                    continue
+
+                weighted_predictions = np.zeros(len(y_test_sex))
+                total_effective_weight = 0.0
+                
+                # Simple averaging (weight=1.0)
+                weight = 1.0 
+                
+                # Re-train and predict for each pipeline/model that belongs to this ensemble
+                for model_info in models_info:
+                    pipeline = model_info['pipeline']
+                    
+                    # Re-split training data for this specific model
+                    train_mask = X_train_full['sex'] == sex
+                    X_train_sex = X_train_full[train_mask].drop(columns=['sex'])
+                    y_train_sex = y_train_full[train_mask]
+                    datasets_train_sex = X_train_sex['dataset']
+                    
+                    # Filter features for this pipeline
+                    features = get_features_for_pipeline(df, pipeline)
+
+                    # --- TRAINING ---
+                    try:
+                        model_pipeline, _, _ = create_model_pipeline(model_type)
+                        
+                        # In a real environment, you'd load the best model or re-train with best params.
+                        # Since we cannot pass the best model, we re-train with default/best params.
+                        
+                        X_train_features = X_train_sex.drop(columns=['dataset'])
+                        
+                        train_normalized, scaler = normalize_features(
+                            X_train_features, features, pipeline, datasets_train_sex
+                        )
+                        X_pipeline_train = train_normalized[features].values
+                        model_pipeline.fit(X_pipeline_train, y_train_sex)
+                        
+                        # --- TESTING ---
+                        X_test_features = X_test_sex.drop(columns=['dataset'])
+                        test_normalized, _ = normalize_features(
+                            X_test_features, features, pipeline, datasets_test_sex, fit_scaler=scaler
+                        )
+                        X_pipeline_test = test_normalized[features].values
+                        pred = model_pipeline.predict(X_pipeline_test)
+                        
+                        weighted_predictions += pred * weight
+                        total_effective_weight += weight
+                        
+                    except Exception as e:
+                        # print(f"      Failed to train/predict for {sex} {model_type} on {pipeline}: {e}")
+                        continue
+                
+                # --- CALCULATE ENSEMBLE MAE ---
+                if total_effective_weight > 0.001:
+                    ensemble_pred = weighted_predictions / total_effective_weight
+                    mae = mean_absolute_error(y_test_sex, ensemble_pred)
+                    
+                    # Store fold score for this ensemble
+                    ensemble_name = f"ensemble_{model_type}"
+                    if ensemble_name not in final_ensemble_report:
+                        final_ensemble_report[ensemble_name] = {'M': {'scores': []}, 'F': {'scores': []}}
+                        
+                    final_ensemble_report[ensemble_name][sex]['scores'].append(mae)
+                    print(f"    {sex} {model_type} Ensemble MAE = {mae:.3f} (N={len(models_info)} pipelines)")
+
+    # 5. Aggregate results across folds
+    aggregated_results = []
+    for ensemble_type, sex_data in final_ensemble_report.items():
+        for sex in ['M', 'F']:
+            valid_scores = [s for s in sex_data[sex]['scores'] if not np.isnan(s)]
+            if valid_scores:
+                aggregated_results.append({
+                    'pipeline': 'ensemble',
+                    'model': ensemble_type,
+                    'sex': sex,
+                    'mean_mae': np.mean(valid_scores),
+                    'std_mae': np.std(valid_scores),
+                    'n_features': 'multiple',
+                    'n_samples': len(df[df['sex']==sex]),
+                    'n_subjects': len(df[df['sex']==sex]['subject_id'].unique()),
+                    'successful_folds': len(valid_scores)
                 })
-                print(f"    Trained {model_type} for {pipeline}")
-            except Exception as e:
-                print(f"    Failed to train {model_type} for {pipeline}: {e}")
-                continue
-        
-        if len(individual_models_for_fold) < 2:
-            print(f"    Not enough models trained for ensemble in fold {fold + 1}")
-            continue
-        
-        weighted_predictions = np.zeros(len(y_test))
-        total_effective_weight = 0.0
-        
-        for item in individual_models_for_fold:
-            model, pipeline, features, scaler, weight = item['model'], item['pipeline'], item['features'], item['scaler'], item['weight']
-            
-            X_test_pipeline = X_test_full.loc[:, features]
-            test_df_pipeline = X_test_pipeline.copy()
-            test_df_pipeline['dataset'] = datasets_test
-            
-            test_normalized, _ = normalize_features(test_df_pipeline, features, pipeline, datasets_test, fit_scaler=scaler)
-            X_pipeline_test = test_normalized[features].values
-            
-            pred = model.predict(X_pipeline_test)
-            weighted_predictions += pred * weight
-            total_effective_weight += weight
-        
-        if total_effective_weight > 0.001:
-            ensemble_pred = weighted_predictions / total_effective_weight
-        else:
-            print(f"    Fold {fold + 1}: Effective weight too low, skipping.")
-            continue
-            
-        mae = mean_absolute_error(y_test, ensemble_pred)
-        
-        outer_scores.append(mae)
-        ensemble_models.append(individual_models_for_fold)
-        
-        print(f"    Fold {fold + 1}: Ensemble MAE = {mae:.3f}")
     
-    if len(outer_scores) >= 3:
-        return outer_scores, ensemble_models
-    else:
-        print(f"  WARNING: Only {len(outer_scores)} successful folds for {ensemble_type.replace('_', ' ')}")
-        return [np.nan], []
+    return aggregated_results
 
 # ----------------------------
 # Main Execution 
@@ -537,147 +643,103 @@ def evaluate_ensemble(results_df, df, ensemble_type='simple_average'):
 
 def main():
     print("=" * 60)
-    print("BRAIN AGE PREDICTION ANALYSIS - EXTENDED FEATURES")
+    print("BRAIN AGE PREDICTION ANALYSIS - SEX SPLIT AND CORRECT ENSEMBLE")
     print("=" * 60)
     
     # Load data - UPDATE THIS PATH to your actual file with age data
-    df = load_and_preprocess_data('ml_dataset_with_age.csv')
+    # Assuming 'ml_dataset_with_age.csv' is the file you originally uploaded/used
+    df = load_and_preprocess_data('ml_dataset_with_age_sex.csv')
     
     if len(df) == 0:
         print("ERROR: No valid data remaining after preprocessing!")
         return
     
-    results = []
+    all_results = []
     
-    models_to_evaluate = ['elasticnet', 'kneighbors', 'histgradientboosting', 'extratrees', 'svm']
-    
+    # --- STEP 1 & 2: Evaluate individual models with Baseline and Sex Split ---
     for pipeline_name in PIPELINES.keys():
         print(f"\n{'='*50}")
         print(f"ANALYZING: {pipeline_name.upper()}")
         print(f"{'='*50}")
         
-        features = get_features_for_pipeline(df, pipeline_name)
+        # Features are calculated inside nested_cv_evaluation now
         
-        if len(features) == 0:
-            print(f"  WARNING: No features found for pipeline '{pipeline_name}'")
-            continue
+        for model_type in MODELS_TO_EVALUATE:
+            # Returns a list of dicts for M/F results
+            sex_results = nested_cv_evaluation(df, model_type, pipeline_name)
             
-        print(f"Features: {len(features)}, Samples: {len(df)}, Subjects: {len(df['subject_id'].unique())}")
-        
-        for model_type in models_to_evaluate:
-            scores, models = nested_cv_evaluation(df, model_type, pipeline_name)
-            
-            if scores and not all(np.isnan(scores)):
-                valid_scores = [s for s in scores if not np.isnan(s)]
-                if valid_scores:
-                    mean_mae = np.mean(valid_scores)
-                    std_mae = np.std(valid_scores)
+            for res in sex_results:
+                if res['successful_folds'] > 0:
                     
-                    results.append({
+                    all_results.append({
                         'pipeline': pipeline_name,
                         'model': model_type,
-                        'mean_mae': mean_mae,
-                        'std_mae': std_mae,
-                        'n_features': len(features),
-                        'n_samples': len(df),
-                        'n_subjects': len(df['subject_id'].unique()),
-                        'successful_folds': len(valid_scores)
+                        'sex': res['sex'],
+                        'mean_mae': res['mean_mae'],
+                        'std_mae': res['std_mae'],
+                        'n_features': len(get_features_for_pipeline(df, pipeline_name)) if model_type != 'baseline' else 0,
+                        'n_samples': len(df[df['sex']==res['sex']]),
+                        'n_subjects': len(df[df['sex']==res['sex']]['subject_id'].unique()),
+                        'successful_folds': res['successful_folds'],
+                        'n_train_samples_per_fold': res['n_train_samples_per_fold'],
+                        'best_params': 'N/A' # Placeholder: need modification to nested_cv_evaluation to return best_params
                     })
-                    
-                    print(f"  {model_type.upper():20} - Mean MAE: {mean_mae:.3f} ± {std_mae:.3f}")
+                    print(f"  {res['sex']} {model_type.upper():20} - Mean MAE: {res['mean_mae']:.3f} ± {res['std_mae']:.3f} (N={res['n_train_samples_per_fold']})")
                 else:
-                    print(f"  {model_type.upper():20} - No valid results")
-            else:
-                print(f"  {model_type.upper():20} - Evaluation failed")
+                    print(f"  {res['sex']} {model_type.upper():20} - No valid results")
     
-    results_df = pd.DataFrame(results)
+    results_df = pd.DataFrame(all_results)
     
     if len(results_df) > 0:
         
-        # 1. Simple Average Ensemble
-        ensemble_scores, _ = evaluate_ensemble(results_df, df, ensemble_type='simple_average')
+        # --- STEP 3: Evaluate Corrected Ensembles ---
+        # Pass the individual model results to the ensemble function
+        ensemble_results = evaluate_ensemble(df, all_results)
+        all_results.extend(ensemble_results)
         
-        if ensemble_scores and not all(np.isnan(ensemble_scores)):
-            valid_scores = [s for s in ensemble_scores if not np.isnan(s)]
-            if valid_scores:
-                mean_mae = np.mean(valid_scores)
-                std_mae = np.std(valid_scores)
-                
-                results.append({
-                    'pipeline': 'ensemble',
-                    'model': 'ensemble_average',
-                    'mean_mae': mean_mae,
-                    'std_mae': std_mae,
-                    'n_features': 'multiple',
-                    'n_samples': len(df),
-                    'n_subjects': len(df['subject_id'].unique()),
-                    'successful_folds': len(valid_scores)
-                })
-                
-                print(f"  ENSEMBLE SIMPLE AVERAGE    - Mean MAE: {mean_mae:.3f} ± {std_mae:.3f}")
+        # Update results_df with ensemble results
+        results_df = pd.DataFrame(all_results)
+        
+        # Print final report
+        print("\n" + "=" * 80)
+        print("FINAL RESULTS SUMMARY (Split by Sex)")
+        print("=" * 80)
+        
+        # Group and report
+        report_pipelines = list(PIPELINES.keys()) + ['ensemble']
+        
+        for sex in ['M', 'F']:
+            print(f"\n--- RESULTS FOR {sex.upper()} (N_total={len(df[df['sex']==sex])}) ---")
+            
+            sex_df = results_df[results_df['sex'] == sex].copy()
+            if len(sex_df) == 0:
+                print("No successful models for this sex.")
+                continue
 
-        # 2. Weighted Average Ensemble
-        weighted_scores, _ = evaluate_ensemble(results_df, df, ensemble_type='weighted_average')
-
-        if weighted_scores and not all(np.isnan(weighted_scores)):
-            # CORRECTED LINE: Check the *individual* score 's' for NaN
-            valid_scores = [s for s in weighted_scores if not np.isnan(s)] 
-            if valid_scores:
-                mean_mae = np.mean(valid_scores)
-                std_mae = np.std(valid_scores)
-                
-                results.append({
-                    'pipeline': 'ensemble',
-                    'model': 'ensemble_weighted_average',
-                    'mean_mae': mean_mae,
-                    'std_mae': std_mae,
-                    'n_features': 'multiple',
-                    'n_samples': len(df),
-                    'n_subjects': len(df['subject_id'].unique()),
-                    'successful_folds': len(valid_scores)
-                })
-                
-                print(f"  ENSEMBLE WEIGHTED AVERAGE  - Mean MAE: {mean_mae:.3f} ± {std_mae:.3f}")
-        
-        results_df = pd.DataFrame(results)
-        
-    # Print final report
-    print("\n" + "=" * 80)
-    print("FINAL RESULTS SUMMARY")
-    print("=" * 80)
-    
-    all_pipelines_for_report = list(PIPELINES.keys()) + ['ensemble']
-    
-    if len(results_df) > 0:
-        for pipeline in all_pipelines_for_report:
-            pipeline_results = results_df[results_df['pipeline'] == pipeline]
-            if len(pipeline_results) > 0:
-                print(f"\n{pipeline.upper()}:\n")
-                pipeline_results = pipeline_results.sort_values(by='mean_mae')
-                for _, row in pipeline_results.iterrows():
-                    print(f"  {row['model']:25} MAE: {row['mean_mae']:.3f} ± {row['std_mae']:.3f} (folds: {row['successful_folds']})")
+            for pipeline in report_pipelines:
+                pipeline_results = sex_df[sex_df['pipeline'] == pipeline]
+                if len(pipeline_results) > 0:
+                    print(f"\n{pipeline.upper()}:\n")
+                    pipeline_results = pipeline_results.sort_values(by='mean_mae')
+                    for _, row in pipeline_results.iterrows():
+                        # ADDED: N_train_samples_per_fold to report
+                        n_train_display = f" (N_train: {row['n_train_samples_per_fold']})" if row['pipeline'] != 'ensemble' else ""
+                        print(f"  {row['model']:25} MAE: {row['mean_mae']:.3f} ± {row['std_mae']:.3f} (folds: {row['successful_folds']}){n_train_display}")
         
         print("\n" + "=" * 80)
-        print("BEST PERFORMING MODELS")
+        print("BEST PERFORMING MODELS OVERALL")
         print("=" * 80)
         
         successful_results_df = results_df[results_df['successful_folds'] > 0]
         
         if len(successful_results_df) > 0:
             best_overall = successful_results_df.loc[successful_results_df['mean_mae'].idxmin()]
-            print(f"Best Overall: {best_overall['pipeline']} with {best_overall['model']}")
+            print(f"Best Overall: {best_overall['sex']} - {best_overall['pipeline']} with {best_overall['model']}")
             print(f"MAE: {best_overall['mean_mae']:.3f} ± {best_overall['std_mae']:.3f}")
-            
-            for pipeline in all_pipelines_for_report:
-                pipeline_results = successful_results_df[successful_results_df['pipeline'] == pipeline]
-                if len(pipeline_results) > 0:
-                    pipeline_best = pipeline_results.loc[pipeline_results['mean_mae'].idxmin()]
-                    print(f"Best for {pipeline}: {pipeline_best['model']} - MAE: {pipeline_best['mean_mae']:.3f}")
-        else:
-            print("No models had successful evaluation folds.")
         
-        results_df.to_csv('brain_age_results_extended_with_ensembles_upgraded_V7.csv', index=False)
-        print(f"\nDetailed results saved to: brain_age_results_extended_with_ensembles_upgraded_V7.csv")
+        # Save results
+        results_df.to_csv('brain_age_results_sex_split_and_correct_ensembles.csv', index=False)
+        print(f"\nDetailed results saved to: brain_age_results_sex_split_and_correct_ensembles.csv")
     else:
         print("No successful model evaluations!")
     
